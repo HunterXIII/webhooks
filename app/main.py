@@ -274,6 +274,54 @@ async def _get_github_pr_head_sha(*, owner: str, repo: str, pr_number: int) -> s
     return str(((body.get("head") or {}).get("sha")) or "")
 
 
+async def _get_github_pr_files(*, owner: str, repo: str, pr_number: int) -> list[str]:
+    if not GITHUB_TOKEN or not owner or not repo:
+        return []
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    files: list[str] = []
+    page = 1
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100&page={page}"
+            response = await client.get(url, headers=headers)
+            if response.status_code >= 400:
+                logger.warning("Failed to fetch PR files: %s", response.text)
+                return files
+            chunk = response.json()
+            if not isinstance(chunk, list) or not chunk:
+                break
+            for item in chunk:
+                filename = item.get("filename")
+                if isinstance(filename, str) and filename:
+                    files.append(filename.strip("/"))
+            if len(chunk) < 100:
+                break
+            page += 1
+    return files
+
+
+def _resolve_finding_path_for_pr(path: str, pr_files: list[str]) -> str:
+    normalized = path.strip().lstrip("./").strip("/")
+    if not normalized or not pr_files:
+        return normalized
+    if normalized in pr_files:
+        return normalized
+    # Try suffix match when scanner path differs from PR root.
+    suffix_matches = [candidate for candidate in pr_files if candidate.endswith(f"/{normalized}")]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    # Try relaxed match by filename only.
+    filename = normalized.split("/")[-1]
+    file_matches = [candidate for candidate in pr_files if candidate.split("/")[-1] == filename]
+    if len(file_matches) == 1:
+        return file_matches[0]
+    return normalized
+
+
 async def _post_github_inline_comment(
     *,
     owner: str,
@@ -422,29 +470,32 @@ async def _wait_scan_and_comment(scan_id: str, pr_context: dict[str, Any]) -> No
 
         if pr_context.get("provider") == "github":
             findings = _extract_report_findings(report) if status == "completed" else []
-            posted_inline = 0
-            posted_file_threads = 0
-            failed_inline: list[str] = []
             owner = str(pr_context.get("owner") or "")
             repo = str(pr_context.get("repo") or "")
             pr_number = int(pr_context["pr_number"])
             fresh_head_sha = await _get_github_pr_head_sha(owner=owner, repo=repo, pr_number=pr_number)
             head_sha = fresh_head_sha or str(pr_context.get("head_sha") or "")
+            pr_files = await _get_github_pr_files(owner=owner, repo=repo, pr_number=pr_number)
+            posted_any = 0
             for finding in findings:
+                finding_path = str(finding["path"])
+                resolved_path = _resolve_finding_path_for_pr(finding_path, pr_files)
+                finding_for_comment = dict(finding)
+                finding_for_comment["path"] = resolved_path
                 ok, reason = await _post_github_inline_comment(
                     owner=owner,
                     repo=repo,
                     pr_number=pr_number,
                     head_sha=head_sha,
-                    path=str(finding["path"]),
+                    path=resolved_path,
                     line=int(finding["line"]),
-                    body=_build_inline_comment_text(scan_id, finding),
+                    body=_build_inline_comment_text(scan_id, finding_for_comment),
                 )
                 if ok:
-                    posted_inline += 1
+                    posted_any += 1
                 else:
                     thread_body = (
-                        _build_inline_comment_text(scan_id, finding)
+                        _build_inline_comment_text(scan_id, finding_for_comment)
                         + "\n\n_Inline line attachment failed, posted as file thread._"
                     )
                     file_ok, file_reason = await _post_github_file_thread_comment(
@@ -452,28 +503,30 @@ async def _wait_scan_and_comment(scan_id: str, pr_context: dict[str, Any]) -> No
                         repo=repo,
                         pr_number=pr_number,
                         head_sha=head_sha,
-                        path=str(finding["path"]),
+                        path=resolved_path,
                         body=thread_body,
                     )
                     if file_ok:
-                        posted_file_threads += 1
+                        posted_any += 1
                     else:
-                        failed_inline.append(
-                            f"- {finding.get('location_raw')}: inline={reason[:100] if reason else 'rejected'}, file={file_reason[:100] if file_reason else 'rejected'}"
+                        fallback_body = (
+                            _build_inline_comment_text(scan_id, finding_for_comment)
+                            + "\n\n_Thread attachment failed for this finding._\n"
+                            + f"\ninline_error: `{(reason or 'rejected')[:200]}`"
+                            + f"\nfile_error: `{(file_reason or 'rejected')[:200]}`"
                         )
-            if posted_inline == 0 and posted_file_threads == 0:
+                await _post_github_comment(
+                    owner=owner,
+                    repo=repo,
+                    pr_number=pr_number,
+                            body=fallback_body,
+                )
+            if posted_any == 0:
                 await _post_github_comment(
                     owner=owner,
                     repo=repo,
                     pr_number=pr_number,
                     body=_build_comment_text(scan_id=scan_id, status=status, report=report),
-                )
-            elif failed_inline:
-                await _post_github_comment(
-                    owner=owner,
-                    repo=repo,
-                    pr_number=pr_number,
-                    body=_build_inline_failures_comment(scan_id, failed_inline),
                 )
             return
 
