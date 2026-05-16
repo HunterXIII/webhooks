@@ -1,11 +1,13 @@
-# GitHub Webhook Test Backend (FastAPI)
+# Webhooks Relay Service (FastAPI)
 
-Тестовый backend для проверки GitHub webhook-сценария:
-- принимает webhook от GitHub;
-- валидирует подпись `X-Hub-Signature-256` (если задан секрет);
-- на событие `pull_request` отправляет комментарий в PR через GitHub API.
+Сервис принимает вебхуки от GitHub/GitVerse, запускает скан в backend
+`https://backend-findwork.ru.tuna.am` (`POST /scan/start`), затем ждёт результат
+`GET /scan/{scan_id}/report` и публикует комментарий в Pull/Merge Request.
 
-## 1) Запуск локально
+Поток:
+- `GitHub` или `GitVerse` -> `webhooks` -> `backend /scan/start` -> wait report -> comment in PR/MR
+
+## 1) Локальный запуск
 
 ```bash
 python -m venv .venv
@@ -18,71 +20,80 @@ uvicorn app.main:app --reload --port 8000
 Проверка:
 - `GET http://localhost:8000/health` -> `{"status":"ok"}`
 
-## 2) Подготовка токена GitHub
-
-Создай Personal Access Token (classic fine-grained тоже можно), минимум с доступом:
-- `Pull requests: Read and write`
-- `Contents: Read`
-
-Запиши токен в `.env`:
+## 2) Конфиг `.env`
 
 ```env
-GITHUB_TOKEN=...
+BACKEND_BASE_URL=https://backend-findwork.ru.tuna.am
+BACKEND_API_KEY=...
 GITHUB_WEBHOOK_SECRET=...
+GITVERSE_WEBHOOK_SECRET=...
+GITHUB_TOKEN=...
+GITVERSE_TOKEN=...
+GITVERSE_API_BASE_URL=https://gitverse.ru/api/v4
+SCAN_INTERACTIVE=false
+DEFAULT_SCAN_QUERY=
+REPORT_POLL_INTERVAL_SECONDS=10
+REPORT_WAIT_TIMEOUT_SECONDS=1800
+REPORT_COMMENT_MAX_CHARS=12000
 ```
 
-## 3) Настройка webhook в репозитории GitHub
+Примечания:
+- `BACKEND_API_KEY` отправляется как `Authorization: Bearer ...`.
+- Если secret не задан, подпись вебхука не проверяется.
+- `DEFAULT_SCAN_QUERY` необязателен; если пустой, запрос формируется автоматически.
+- `GITHUB_TOKEN` нужен для комментариев в GitHub PR.
+- `GITVERSE_TOKEN` нужен для комментариев в GitVerse MR/PR.
 
-`Settings` -> `Webhooks` -> `Add webhook`:
-- `Payload URL`: публичный URL твоего backend + `/webhooks/github`
-  - пример: `https://<your-ngrok-domain>/webhooks/github`
-- `Content type`: `application/json`
-- `Secret`: тот же, что `GITHUB_WEBHOOK_SECRET`
-- `Which events`: `Let me select individual events` -> `Pull requests`
+## 3) URL для webhook-ов
 
-## 4) Локальный тест через ngrok (пример)
+- GitHub: `POST /webhooks/github`
+- GitVerse: `POST /webhooks/gitverse`
 
-```bash
-ngrok http 8000
+Пример публичного URL:
+- `https://<your-domain>/webhooks/github`
+- `https://<your-domain>/webhooks/gitverse`
+
+## 4) Какие события обрабатываются
+
+- GitHub: `push`, `pull_request` (и `ping` для проверки)
+- GitVerse: `push`, `merge_request`, `pull_request`
+
+Остальные события возвращаются как `ignored`.
+
+## 5) Что отправляется в backend
+
+На каждое поддерживаемое событие сервис делает:
+- `POST {BACKEND_BASE_URL}/scan/start`
+
+Тело запроса:
+
+```json
+{
+  "repo_url": "https://example.org/repo.git",
+  "interactive": false,
+  "query": "Webhook-triggered security scan (github:push)"
+}
 ```
 
-Скопируй `https` URL от ngrok в `Payload URL`.
-
-## 5) Что обрабатывается
-
-Сервис реагирует только на событие `pull_request` и action:
-- `opened`
-- `reopened`
-- `synchronize`
-- `ready_for_review`
-
-Для других событий/действий возвращается `ignored`.
-
-## 6) Кастомизация текста комментария
-
-Через переменную:
-
-```env
-PR_COMMENT_TEMPLATE=Automated test comment for `{repo}` PR #{pr_number} (action: `{action}`).
-```
-
-Доступные шаблонные поля:
-- `{owner}`
-- `{repo}`
-- `{pr_number}`
-- `{action}`
-- `{pr_title}`
-
-## 7) Пример ответа webhook endpoint
+## 6) Пример ответа relay endpoint
 
 ```json
 {
   "ok": true,
-  "event": "pull_request",
-  "delivery": "8f9f8f24-...",
-  "repository": "owner/repo",
-  "pr_number": 42,
-  "comment_id": 1234567890,
-  "comment_url": "https://github.com/owner/repo/pull/42#issuecomment-..."
+  "provider": "github",
+  "event": "push",
+  "delivery": "12345",
+  "repo_url": "https://github.com/org/repo.git",
+  "backend_scan_id": "scan_abc123",
+  "comment_scheduled": true
 }
 ```
+
+## 7) Как формируется комментарий
+
+- Для GitHub: комментарий идёт в `issues/{pr_number}/comments`.
+- Для GitVerse: комментарий идёт в `projects/{project_id}/merge_requests/{iid}/notes`.
+- Текст комментария содержит:
+  - scan id
+  - итоговый статус (`completed`/`failed`/`timeout`)
+  - найденный отчёт backend (с ограничением длины `REPORT_COMMENT_MAX_CHARS`).
