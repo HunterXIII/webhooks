@@ -35,6 +35,7 @@ DEFAULT_SCAN_QUERY=
 REPORT_POLL_INTERVAL_SECONDS=10
 REPORT_WAIT_TIMEOUT_SECONDS=1800
 REPORT_COMMENT_MAX_CHARS=12000
+INLINE_COMMENTS_MAX=20
 ```
 
 Примечания:
@@ -43,6 +44,7 @@ REPORT_COMMENT_MAX_CHARS=12000
 - `DEFAULT_SCAN_QUERY` необязателен; если пустой, запрос формируется автоматически.
 - `GITHUB_TOKEN` нужен для комментариев в GitHub PR.
 - `GITVERSE_TOKEN` нужен для комментариев в GitVerse MR/PR.
+- `INLINE_COMMENTS_MAX` ограничивает количество inline-комментариев за один отчёт.
 
 ## 3) URL для webhook-ов
 
@@ -97,3 +99,13 @@ REPORT_COMMENT_MAX_CHARS=12000
   - scan id
   - итоговый статус (`completed`/`failed`/`timeout`)
   - найденный отчёт backend (с ограничением длины `REPORT_COMMENT_MAX_CHARS`).
+
+## 8) Inline-комментарии по строкам кода
+
+Если в отчёте есть строки формата `Файл: app/main.py:26`, сервис пытается создать
+inline-комментарий прямо на этой строке в PR/MR.
+
+- GitHub: через review comments API (`pulls/{pr}/comments`).
+- GitVerse: через discussions API (`merge_requests/{iid}/discussions`).
+- Если inline-комментарий нельзя поставить (например, строка не входит в diff),
+  сервис автоматически делает fallback в обычный общий комментарий.

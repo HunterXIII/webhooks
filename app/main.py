@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from urllib.parse import urlparse
 from typing import Any
 
@@ -20,6 +21,7 @@ SCAN_INTERACTIVE = os.getenv("SCAN_INTERACTIVE", "false").lower() == "true"
 REPORT_POLL_INTERVAL_SECONDS = max(2, int(os.getenv("REPORT_POLL_INTERVAL_SECONDS", "10")))
 REPORT_WAIT_TIMEOUT_SECONDS = max(30, int(os.getenv("REPORT_WAIT_TIMEOUT_SECONDS", "1800")))
 REPORT_COMMENT_MAX_CHARS = max(1000, int(os.getenv("REPORT_COMMENT_MAX_CHARS", "12000")))
+INLINE_COMMENTS_MAX = max(1, int(os.getenv("INLINE_COMMENTS_MAX", "20")))
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 GITVERSE_WEBHOOK_SECRET = os.getenv("GITVERSE_WEBHOOK_SECRET", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -31,6 +33,10 @@ ALLOWED_GITVERSE_EVENTS = {"push", "merge_request", "pull_request"}
 
 app = FastAPI(title="Webhook Relay Service", version="1.0.0")
 logger = logging.getLogger(__name__)
+FILE_LINE_PATTERN = re.compile(
+    r"(?:Файл|File)\s*:\s*(?P<path>[^:\n]+):(?P<line>\d+)",
+    flags=re.IGNORECASE,
+)
 
 
 def _verify_signature(
@@ -81,6 +87,23 @@ def _extract_event(provider: str, header_event: str | None, payload: dict[str, A
     return str(event).strip().lower()
 
 
+def _is_closed_github_pull_request(event: str, payload: dict[str, Any]) -> bool:
+    if event != "pull_request":
+        return False
+    action = str(payload.get("action") or "").strip().lower()
+    pr_state = str((payload.get("pull_request") or {}).get("state") or "").strip().lower()
+    return action == "closed" or pr_state == "closed"
+
+
+def _is_closed_gitverse_merge_request(event: str, payload: dict[str, Any]) -> bool:
+    if event not in {"merge_request", "pull_request"}:
+        return False
+    attrs = payload.get("object_attributes") or {}
+    action = str(attrs.get("action") or payload.get("action") or "").strip().lower()
+    state = str(attrs.get("state") or "").strip().lower()
+    return action in {"close", "closed"} or state == "closed"
+
+
 def _backend_headers() -> dict[str, str]:
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if BACKEND_API_KEY:
@@ -117,6 +140,7 @@ def _extract_pr_context(provider: str, event: str, payload: dict[str, Any], repo
             "owner": owner,
             "repo": repo_name,
             "pr_number": pr_number,
+            "head_sha": ((payload.get("pull_request") or {}).get("head") or {}).get("sha") or "",
         }
 
     if event not in {"pull_request", "merge_request"}:
@@ -131,10 +155,20 @@ def _extract_pr_context(provider: str, event: str, payload: dict[str, Any], repo
         project_id = (payload.get("repository") or {}).get("id")
     if not isinstance(pr_number, int) or not isinstance(project_id, int):
         return None
+    diff_refs = object_attributes.get("diff_refs") or {}
+    last_commit = object_attributes.get("last_commit")
+    last_commit_sha = ""
+    if isinstance(last_commit, dict):
+        last_commit_sha = str(last_commit.get("id") or "")
+    elif isinstance(last_commit, str):
+        last_commit_sha = last_commit
     return {
         "provider": "gitverse",
         "project_id": project_id,
         "pr_number": pr_number,
+        "base_sha": diff_refs.get("base_sha") or object_attributes.get("oldrev") or "",
+        "start_sha": diff_refs.get("start_sha") or object_attributes.get("oldrev") or "",
+        "head_sha": diff_refs.get("head_sha") or last_commit_sha or object_attributes.get("newrev") or "",
     }
 
 
@@ -149,6 +183,77 @@ def _build_comment_text(scan_id: str, status: str, report: str | None) -> str:
     if len(details) > REPORT_COMMENT_MAX_CHARS:
         details = details[:REPORT_COMMENT_MAX_CHARS] + "\n\n...truncated..."
     return "\n".join(summary) + "\n\n### Findings\n\n" + details
+
+
+def _extract_report_findings(report: str | None) -> list[dict[str, Any]]:
+    if not report:
+        return []
+    lines = report.splitlines()
+    findings: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(lines):
+        match = FILE_LINE_PATTERN.search(lines[idx])
+        if not match:
+            idx += 1
+            continue
+        path = match.group("path").strip().lstrip("./")
+        line = int(match.group("line"))
+        details: list[str] = []
+        cursor = idx + 1
+        while cursor < len(lines):
+            next_match = FILE_LINE_PATTERN.search(lines[cursor])
+            if next_match:
+                break
+            cleaned = lines[cursor].strip()
+            if cleaned:
+                details.append(cleaned)
+            cursor += 1
+        findings.append(
+            {
+                "path": path,
+                "line": line,
+                "location_raw": f"Файл: {path}:{line}",
+                "details": "\n".join(details[:12]),
+            }
+        )
+        idx = cursor
+
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for finding in findings:
+        key = (str(finding["path"]), int(finding["line"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(finding)
+        if len(unique) >= INLINE_COMMENTS_MAX:
+            break
+    return unique
+
+
+def _build_inline_comment_text(scan_id: str, finding: dict[str, Any]) -> str:
+    details = str(finding.get("details") or "Potential security issue found by automated scan.")
+    if len(details) > 1200:
+        details = details[:1200] + "\n\n...truncated..."
+    location_text = str(finding.get("location_raw") or f"Файл: {finding['path']}:{finding['line']}")
+    return (
+        "Automated security finding.\n\n"
+        f"Scan ID: `{scan_id}`\n"
+        f"{location_text}\n\n"
+        f"{details}"
+    )
+
+
+def _build_inline_failures_comment(scan_id: str, failures: list[str]) -> str:
+    preview = "\n".join(failures[:10])
+    if len(failures) > 10:
+        preview += f"\n... and {len(failures) - 10} more"
+    return (
+        "## Automated Security Scan\n"
+        f"- Scan ID: `{scan_id}`\n\n"
+        "Inline comments were not created for some findings:\n\n"
+        f"{preview}"
+    )
 
 
 async def _post_github_comment(*, owner: str, repo: str, pr_number: int, body: str) -> None:
@@ -168,6 +273,159 @@ async def _post_github_comment(*, owner: str, repo: str, pr_number: int, body: s
         raise RuntimeError(f"GitHub comment failed: {response.status_code} {response.text}")
 
 
+async def _post_github_review(
+    *,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    event: str,
+    body: str,
+) -> None:
+    if not GITHUB_TOKEN or not owner or not repo:
+        return
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {"event": event, "body": body}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+    if response.status_code >= 400:
+        logger.warning("GitHub review submission failed: %s", response.text)
+
+
+async def _get_github_pr_head_sha(*, owner: str, repo: str, pr_number: int) -> str:
+    if not GITHUB_TOKEN or not owner or not repo:
+        return ""
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url, headers=headers)
+    if response.status_code >= 400:
+        logger.warning("Failed to fetch PR head SHA: %s", response.text)
+        return ""
+    body = response.json()
+    return str(((body.get("head") or {}).get("sha")) or "")
+
+
+async def _get_github_pr_files(*, owner: str, repo: str, pr_number: int) -> list[str]:
+    if not GITHUB_TOKEN or not owner or not repo:
+        return []
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    files: list[str] = []
+    page = 1
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100&page={page}"
+            response = await client.get(url, headers=headers)
+            if response.status_code >= 400:
+                logger.warning("Failed to fetch PR files: %s", response.text)
+                return files
+            chunk = response.json()
+            if not isinstance(chunk, list) or not chunk:
+                break
+            for item in chunk:
+                filename = item.get("filename")
+                if isinstance(filename, str) and filename:
+                    files.append(filename.strip("/"))
+            if len(chunk) < 100:
+                break
+            page += 1
+    return files
+
+
+def _resolve_finding_path_for_pr(path: str, pr_files: list[str]) -> str:
+    normalized = path.strip().lstrip("./").strip("/")
+    if not normalized or not pr_files:
+        return normalized
+    if normalized in pr_files:
+        return normalized
+    # Try suffix match when scanner path differs from PR root.
+    suffix_matches = [candidate for candidate in pr_files if candidate.endswith(f"/{normalized}")]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    # Try relaxed match by filename only.
+    filename = normalized.split("/")[-1]
+    file_matches = [candidate for candidate in pr_files if candidate.split("/")[-1] == filename]
+    if len(file_matches) == 1:
+        return file_matches[0]
+    return normalized
+
+
+async def _post_github_inline_comment(
+    *,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    path: str,
+    line: int,
+    body: str,
+) -> tuple[bool, str]:
+    if not GITHUB_TOKEN or not owner or not repo or not head_sha:
+        return False, "missing GitHub token/repo/head_sha"
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "body": body,
+        "commit_id": head_sha,
+        "path": path,
+        "line": line,
+        "side": "RIGHT",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+    if response.status_code >= 400:
+        logger.warning("GitHub inline comment rejected for %s:%s: %s", path, line, response.text)
+        return False, response.text
+    return True, ""
+
+
+async def _post_github_file_thread_comment(
+    *,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    path: str,
+    body: str,
+) -> tuple[bool, str]:
+    if not GITHUB_TOKEN or not owner or not repo or not head_sha:
+        return False, "missing GitHub token/repo/head_sha"
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "body": body,
+        "commit_id": head_sha,
+        "path": path,
+        "subject_type": "file",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+    if response.status_code >= 400:
+        logger.warning("GitHub file thread rejected for %s: %s", path, response.text)
+        return False, response.text
+    return True, ""
+
+
 async def _post_gitverse_comment(*, project_id: int, pr_number: int, body: str) -> None:
     if not GITVERSE_TOKEN:
         return
@@ -181,6 +439,44 @@ async def _post_gitverse_comment(*, project_id: int, pr_number: int, body: str) 
         response = await client.post(url, headers=headers, json={"body": body})
     if response.status_code >= 400:
         raise RuntimeError(f"GitVerse comment failed: {response.status_code} {response.text}")
+
+
+async def _post_gitverse_inline_comment(
+    *,
+    project_id: int,
+    pr_number: int,
+    path: str,
+    line: int,
+    body: str,
+    base_sha: str,
+    start_sha: str,
+    head_sha: str,
+) -> tuple[bool, str]:
+    if not GITVERSE_TOKEN or not base_sha or not start_sha or not head_sha:
+        return False, "missing GitVerse token or diff refs"
+    url = f"{GITVERSE_API_BASE_URL}/projects/{project_id}/merge_requests/{pr_number}/discussions"
+    headers = {
+        "Authorization": f"Bearer {GITVERSE_TOKEN}",
+        "PRIVATE-TOKEN": GITVERSE_TOKEN,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "body": body,
+        "position": {
+            "position_type": "text",
+            "base_sha": base_sha,
+            "start_sha": start_sha,
+            "head_sha": head_sha,
+            "new_path": path,
+            "new_line": line,
+        },
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+    if response.status_code >= 400:
+        logger.warning("GitVerse inline comment rejected for %s:%s: %s", path, line, response.text)
+        return False, response.text
+    return True, ""
 
 
 async def _wait_scan_and_comment(scan_id: str, pr_context: dict[str, Any]) -> None:
@@ -212,23 +508,121 @@ async def _wait_scan_and_comment(scan_id: str, pr_context: dict[str, Any]) -> No
             status = "timeout"
             report = "Timed out while waiting for backend scan result."
 
-        comment_body = _build_comment_text(scan_id=scan_id, status=status, report=report)
-
         if pr_context.get("provider") == "github":
-            await _post_github_comment(
-                owner=str(pr_context.get("owner") or ""),
-                repo=str(pr_context.get("repo") or ""),
-                pr_number=int(pr_context["pr_number"]),
-                body=comment_body,
-            )
+            findings = _extract_report_findings(report) if status == "completed" else []
+            owner = str(pr_context.get("owner") or "")
+            repo = str(pr_context.get("repo") or "")
+            pr_number = int(pr_context["pr_number"])
+            fresh_head_sha = await _get_github_pr_head_sha(owner=owner, repo=repo, pr_number=pr_number)
+            head_sha = fresh_head_sha or str(pr_context.get("head_sha") or "")
+            pr_files = await _get_github_pr_files(owner=owner, repo=repo, pr_number=pr_number)
+            posted_any = 0
+            fallback_posted = 0
+            for finding in findings:
+                finding_path = str(finding["path"])
+                resolved_path = _resolve_finding_path_for_pr(finding_path, pr_files)
+                finding_for_comment = dict(finding)
+                finding_for_comment["path"] = resolved_path
+                ok, reason = await _post_github_inline_comment(
+                    owner=owner,
+                    repo=repo,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    path=resolved_path,
+                    line=int(finding["line"]),
+                    body=_build_inline_comment_text(scan_id, finding_for_comment),
+                )
+                if ok:
+                    posted_any += 1
+                else:
+                    thread_body = (
+                        _build_inline_comment_text(scan_id, finding_for_comment)
+                        + "\n\n_Inline line attachment failed, posted as file thread._"
+                    )
+                    file_ok, file_reason = await _post_github_file_thread_comment(
+                        owner=owner,
+                        repo=repo,
+                        pr_number=pr_number,
+                        head_sha=head_sha,
+                        path=resolved_path,
+                        body=thread_body,
+                    )
+                    if file_ok:
+                        posted_any += 1
+                    else:
+                        fallback_body = (
+                            _build_inline_comment_text(scan_id, finding_for_comment)
+                            + "\n\n_Thread attachment failed for this finding._\n"
+                            + f"\ninline_error: `{(reason or 'rejected')[:200]}`"
+                            + f"\nfile_error: `{(file_reason or 'rejected')[:200]}`"
+                        )
+                        await _post_github_comment(
+                            owner=owner,
+                            repo=repo,
+                            pr_number=pr_number,
+                            body=fallback_body,
+                        )
+                        fallback_posted += 1
+
+            if findings:
+                review_body = (
+                    "Security scan found vulnerabilities. "
+                    "Resolve all review threads and fix findings before merge.\n\n"
+                    f"Scan ID: `{scan_id}`\n"
+                    f"Findings in report: `{len(findings)}`\n"
+                    f"Attached as code threads: `{posted_any}`\n"
+                    f"Fallback comments: `{fallback_posted}`"
+                )
+                await _post_github_review(
+                    owner=owner,
+                    repo=repo,
+                    pr_number=pr_number,
+                    event="REQUEST_CHANGES",
+                    body=review_body,
+                )
+
+            if posted_any == 0 and fallback_posted == 0:
+                await _post_github_comment(
+                    owner=owner,
+                    repo=repo,
+                    pr_number=pr_number,
+                    body=_build_comment_text(scan_id=scan_id, status=status, report=report),
+                )
             return
 
         if pr_context.get("provider") == "gitverse":
-            await _post_gitverse_comment(
-                project_id=int(pr_context["project_id"]),
-                pr_number=int(pr_context["pr_number"]),
-                body=comment_body,
-            )
+            findings = _extract_report_findings(report) if status == "completed" else []
+            posted_inline = 0
+            failed_inline: list[str] = []
+            for finding in findings:
+                ok, reason = await _post_gitverse_inline_comment(
+                    project_id=int(pr_context["project_id"]),
+                    pr_number=int(pr_context["pr_number"]),
+                    path=str(finding["path"]),
+                    line=int(finding["line"]),
+                    body=_build_inline_comment_text(scan_id, finding),
+                    base_sha=str(pr_context.get("base_sha") or ""),
+                    start_sha=str(pr_context.get("start_sha") or ""),
+                    head_sha=str(pr_context.get("head_sha") or ""),
+                )
+                if ok:
+                    posted_inline += 1
+                else:
+                    failed_inline.append(
+                        f"- {finding.get('location_raw')}: {reason[:180] if reason else 'rejected by API'}"
+                    )
+            if posted_inline == 0:
+                await _post_gitverse_comment(
+                    project_id=int(pr_context["project_id"]),
+                    pr_number=int(pr_context["pr_number"]),
+                    body=_build_comment_text(scan_id=scan_id, status=status, report=report),
+                )
+            elif failed_inline:
+                await _post_gitverse_comment(
+                    project_id=int(pr_context["project_id"]),
+                    pr_number=int(pr_context["pr_number"]),
+                    body=_build_inline_failures_comment(scan_id, failed_inline),
+                )
             return
     except Exception:
         logger.exception("Failed to publish scan comment for scan_id=%s", scan_id)
@@ -304,16 +698,23 @@ async def github_webhook(
             "ignored": True,
             "reason": f"Allowed events: {sorted(ALLOWED_GITHUB_EVENTS)}",
         }
+    if _is_closed_github_pull_request(event, payload):
+        return {
+            "ok": True,
+            "provider": "github",
+            "event": event,
+            "delivery": x_github_delivery,
+            "ignored": True,
+            "reason": "pull_request is closed; backend scan is skipped",
+        }
 
     repo_url = _extract_repo_url(payload)
-    print("хуй")
     backend_response = await _forward_to_backend(
         repo_url=repo_url,
         provider="github",
         event=event,
         delivery=x_github_delivery,
     )
-    print("хуй2")
     pr_context = _extract_pr_context("github", event, payload, repo_url)
     if pr_context and backend_response.get("backend_scan_id"):
         background_tasks.add_task(_wait_scan_and_comment, str(backend_response["backend_scan_id"]), pr_context)
@@ -354,6 +755,15 @@ async def gitverse_webhook(
             "delivery": x_gitverse_delivery,
             "ignored": True,
             "reason": f"Allowed events: {sorted(ALLOWED_GITVERSE_EVENTS)}",
+        }
+    if _is_closed_gitverse_merge_request(event, payload):
+        return {
+            "ok": True,
+            "provider": "gitverse",
+            "event": event,
+            "delivery": x_gitverse_delivery,
+            "ignored": True,
+            "reason": "merge/pull request is closed; backend scan is skipped",
         }
 
     repo_url = _extract_repo_url(payload)
