@@ -87,6 +87,23 @@ def _extract_event(provider: str, header_event: str | None, payload: dict[str, A
     return str(event).strip().lower()
 
 
+def _is_closed_github_pull_request(event: str, payload: dict[str, Any]) -> bool:
+    if event != "pull_request":
+        return False
+    action = str(payload.get("action") or "").strip().lower()
+    pr_state = str((payload.get("pull_request") or {}).get("state") or "").strip().lower()
+    return action == "closed" or pr_state == "closed"
+
+
+def _is_closed_gitverse_merge_request(event: str, payload: dict[str, Any]) -> bool:
+    if event not in {"merge_request", "pull_request"}:
+        return False
+    attrs = payload.get("object_attributes") or {}
+    action = str(attrs.get("action") or payload.get("action") or "").strip().lower()
+    state = str(attrs.get("state") or "").strip().lower()
+    return action in {"close", "closed"} or state == "closed"
+
+
 def _backend_headers() -> dict[str, str]:
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if BACKEND_API_KEY:
@@ -638,6 +655,15 @@ async def github_webhook(
             "ignored": True,
             "reason": f"Allowed events: {sorted(ALLOWED_GITHUB_EVENTS)}",
         }
+    if _is_closed_github_pull_request(event, payload):
+        return {
+            "ok": True,
+            "provider": "github",
+            "event": event,
+            "delivery": x_github_delivery,
+            "ignored": True,
+            "reason": "pull_request is closed; backend scan is skipped",
+        }
 
     repo_url = _extract_repo_url(payload)
     backend_response = await _forward_to_backend(
@@ -686,6 +712,15 @@ async def gitverse_webhook(
             "delivery": x_gitverse_delivery,
             "ignored": True,
             "reason": f"Allowed events: {sorted(ALLOWED_GITVERSE_EVENTS)}",
+        }
+    if _is_closed_gitverse_merge_request(event, payload):
+        return {
+            "ok": True,
+            "provider": "gitverse",
+            "event": event,
+            "delivery": x_gitverse_delivery,
+            "ignored": True,
+            "reason": "merge/pull request is closed; backend scan is skipped",
         }
 
     repo_url = _extract_repo_url(payload)
