@@ -273,6 +273,29 @@ async def _post_github_comment(*, owner: str, repo: str, pr_number: int, body: s
         raise RuntimeError(f"GitHub comment failed: {response.status_code} {response.text}")
 
 
+async def _post_github_review(
+    *,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    event: str,
+    body: str,
+) -> None:
+    if not GITHUB_TOKEN or not owner or not repo:
+        return
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {"event": event, "body": body}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+    if response.status_code >= 400:
+        logger.warning("GitHub review submission failed: %s", response.text)
+
+
 async def _get_github_pr_head_sha(*, owner: str, repo: str, pr_number: int) -> str:
     if not GITHUB_TOKEN or not owner or not repo:
         return ""
@@ -494,6 +517,7 @@ async def _wait_scan_and_comment(scan_id: str, pr_context: dict[str, Any]) -> No
             head_sha = fresh_head_sha or str(pr_context.get("head_sha") or "")
             pr_files = await _get_github_pr_files(owner=owner, repo=repo, pr_number=pr_number)
             posted_any = 0
+            fallback_posted = 0
             for finding in findings:
                 finding_path = str(finding["path"])
                 resolved_path = _resolve_finding_path_for_pr(finding_path, pr_files)
@@ -532,13 +556,32 @@ async def _wait_scan_and_comment(scan_id: str, pr_context: dict[str, Any]) -> No
                             + f"\ninline_error: `{(reason or 'rejected')[:200]}`"
                             + f"\nfile_error: `{(file_reason or 'rejected')[:200]}`"
                         )
-                await _post_github_comment(
+                        await _post_github_comment(
+                            owner=owner,
+                            repo=repo,
+                            pr_number=pr_number,
+                            body=fallback_body,
+                        )
+                        fallback_posted += 1
+
+            if findings:
+                review_body = (
+                    "Security scan found vulnerabilities. "
+                    "Resolve all review threads and fix findings before merge.\n\n"
+                    f"Scan ID: `{scan_id}`\n"
+                    f"Findings in report: `{len(findings)}`\n"
+                    f"Attached as code threads: `{posted_any}`\n"
+                    f"Fallback comments: `{fallback_posted}`"
+                )
+                await _post_github_review(
                     owner=owner,
                     repo=repo,
                     pr_number=pr_number,
-                            body=fallback_body,
+                    event="REQUEST_CHANGES",
+                    body=review_body,
                 )
-            if posted_any == 0:
+
+            if posted_any == 0 and fallback_posted == 0:
                 await _post_github_comment(
                     owner=owner,
                     repo=repo,
