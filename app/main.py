@@ -307,6 +307,37 @@ async def _post_github_inline_comment(
     return True, ""
 
 
+async def _post_github_file_thread_comment(
+    *,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    path: str,
+    body: str,
+) -> tuple[bool, str]:
+    if not GITHUB_TOKEN or not owner or not repo or not head_sha:
+        return False, "missing GitHub token/repo/head_sha"
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "body": body,
+        "commit_id": head_sha,
+        "path": path,
+        "subject_type": "file",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+    if response.status_code >= 400:
+        logger.warning("GitHub file thread rejected for %s: %s", path, response.text)
+        return False, response.text
+    return True, ""
+
+
 async def _post_gitverse_comment(*, project_id: int, pr_number: int, body: str) -> None:
     if not GITVERSE_TOKEN:
         return
@@ -392,6 +423,7 @@ async def _wait_scan_and_comment(scan_id: str, pr_context: dict[str, Any]) -> No
         if pr_context.get("provider") == "github":
             findings = _extract_report_findings(report) if status == "completed" else []
             posted_inline = 0
+            posted_file_threads = 0
             failed_inline: list[str] = []
             owner = str(pr_context.get("owner") or "")
             repo = str(pr_context.get("repo") or "")
@@ -411,10 +443,25 @@ async def _wait_scan_and_comment(scan_id: str, pr_context: dict[str, Any]) -> No
                 if ok:
                     posted_inline += 1
                 else:
-                    failed_inline.append(
-                        f"- {finding.get('location_raw')}: {reason[:180] if reason else 'rejected by API'}"
+                    thread_body = (
+                        _build_inline_comment_text(scan_id, finding)
+                        + "\n\n_Inline line attachment failed, posted as file thread._"
                     )
-            if posted_inline == 0:
+                    file_ok, file_reason = await _post_github_file_thread_comment(
+                        owner=owner,
+                        repo=repo,
+                        pr_number=pr_number,
+                        head_sha=head_sha,
+                        path=str(finding["path"]),
+                        body=thread_body,
+                    )
+                    if file_ok:
+                        posted_file_threads += 1
+                    else:
+                        failed_inline.append(
+                            f"- {finding.get('location_raw')}: inline={reason[:100] if reason else 'rejected'}, file={file_reason[:100] if file_reason else 'rejected'}"
+                        )
+            if posted_inline == 0 and posted_file_threads == 0:
                 await _post_github_comment(
                     owner=owner,
                     repo=repo,
