@@ -306,12 +306,14 @@ async def github_webhook(
         }
 
     repo_url = _extract_repo_url(payload)
+    print("хуй")
     backend_response = await _forward_to_backend(
         repo_url=repo_url,
         provider="github",
         event=event,
         delivery=x_github_delivery,
     )
+    print("хуй2")
     pr_context = _extract_pr_context("github", event, payload, repo_url)
     if pr_context and backend_response.get("backend_scan_id"):
         background_tasks.add_task(_wait_scan_and_comment, str(backend_response["backend_scan_id"]), pr_context)
